@@ -2,5 +2,6 @@
 .gradle
 .cache
 .cxx
+*.ttf
 # Ignore Gradle build output directory
 build

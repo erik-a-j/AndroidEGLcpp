@@ -12,6 +12,12 @@ add_custom_target(copy_compile_commands ALL
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMENT "Copying compile_commands.json to source directory"
 )
+add_custom_target(copy_font ALL
+    COMMAND bash ${CMAKE_SOURCE_DIR}/../tools/copyfont.sh
+    "${CMAKE_SOURCE_DIR}/../assets"
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    COMMENT "Copying font to assets directory"
+)
 
 # Build glue directly into the shared library so ANativeActivity_onCreate is present.
 add_library(native-lib SHARED
@@ -25,7 +31,7 @@ add_library(native-lib SHARED
 target_include_directories(native-lib PRIVATE
     ${ANDROID_NDK}/sources/android/native_app_glue
 )
-add_dependencies(native-lib copy_compile_commands)
+add_dependencies(native-lib copy_font copy_compile_commands)
 
 set(FT_DISABLE_ZLIB TRUE CACHE BOOL "" FORCE)
 set(FT_DISABLE_BZIP2 TRUE CACHE BOOL "" FORCE)
