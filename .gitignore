@@ -3,5 +3,6 @@
 .cache
 .cxx
 *.ttf
+compile_commands.json
 # Ignore Gradle build output directory
 build
