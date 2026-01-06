@@ -1,17 +1,75 @@
-// text_system.cpp (updated to own shader program like UiRenderer)
-#include "config.h"
-#if GLES_VERSION == 3
+// text_system.cpp
 #include <GLES3/gl3.h>
-#else
-#include <GLES2/gl2.h>
-#endif
 
 #include "text_renderer.hpp"
 #include <cstring>
 #include <cstddef>
 #include <algorithm>
 
-#if GLES_VERSION == 3
+#define LOG_NAMESPACE "TextR"
+#include "logging.hpp"
+
+static void logShader(GLuint s, const char* label) {
+    GLint len = 0;
+    glGetShaderiv(s, GL_INFO_LOG_LENGTH, &len);
+    if (len > 1) {
+        std::vector<char> buf((size_t)len);
+        glGetShaderInfoLog(s, len, nullptr, buf.data());
+        logx::Ef("{} Text shader log:\n{}", label, buf.data());
+    }
+}
+static void logProgram(GLuint p) {
+    GLint len = 0;
+    glGetProgramiv(p, GL_INFO_LOG_LENGTH, &len);
+    if (len > 1) {
+        std::vector<char> buf((size_t)len);
+        glGetProgramInfoLog(p, len, nullptr, buf.data());
+        logx::Ef("Text program log:\n{}", buf.data());
+    }
+}
+
+static std::vector<uint32_t> buildUtf8Index(const char* utf8) {
+    std::vector<uint32_t> out;
+    for (uint32_t i = 0; utf8[i]; ) {
+        out.push_back(i);
+        unsigned char c = (unsigned char)utf8[i];
+        i += (c < 0x80) ? 1 :
+             ((c & 0xE0) == 0xC0) ? 2 :
+             ((c & 0xF0) == 0xE0) ? 3 : 4;
+    }
+    out.push_back((uint32_t)strlen(utf8));
+    return out;
+}
+static int utf8_codepoint_count_from_index(const std::vector<uint32_t>& cpByteOffsets) {
+    return (cpByteOffsets.size() >= 1) ? (int)cpByteOffsets.size() - 1 : 0;
+}
+static int codepointIndexFromCluster(
+    uint32_t clusterByte,
+    const std::vector<uint32_t>& cpByteOffsets)
+{
+    // find greatest i where cpByteOffsets[i] <= clusterByte
+    auto it = std::upper_bound(cpByteOffsets.begin(), cpByteOffsets.end(), clusterByte);
+    if (it == cpByteOffsets.begin()) return 0;
+    return (int)std::distance(cpByteOffsets.begin(), it - 1);
+}
+int TextRenderer::caretIndexFromLocalX(const TextObj& t, float localX) {
+    if (t.caretX.empty()) return 0;
+
+    if (localX <= t.caretX.front()) return 0;
+    if (localX >= t.caretX.back())  return (int)t.caretX.size() - 1;
+
+    auto it = std::lower_bound(t.caretX.begin(), t.caretX.end(), localX);
+    int i = (int)std::distance(t.caretX.begin(), it);
+    if (i <= 0) return 0;
+
+    float a = t.caretX[(size_t)i - 1];
+    float b = t.caretX[(size_t)i];
+    return (localX - a) < (b - localX) ? (i - 1) : i;
+}
+static bool pointInRect(float px, float py, float x0, float y0, float x1, float y1) {
+    return (px >= x0 && px <= x1 && py >= y0 && py <= y1);
+}
+
 static void setupTextVao(GLuint vao, GLuint vbo) {
     glBindVertexArray(vao);
 
@@ -25,34 +83,35 @@ static void setupTextVao(GLuint vao, GLuint vbo) {
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE,
                           sizeof(TextVtx), (void*)offsetof(TextVtx, u));
     
+    glEnableVertexAttribArray(2); // aColor
+    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE,
+                          sizeof(TextVtx), (void*)offsetof(TextVtx, r));
+
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindVertexArray(0);
 }
-#endif
 
 TextRenderer::~TextRenderer() { shutdown(); }
 
-bool TextRenderer::init(const char* fontFilePath, int pixelSize, int atlasW, int atlasH) {
+bool TextRenderer::init(const Assets::Manager& am, const std::string& font_name, int pixelSize, int atlasW, int atlasH) {
     shutdown();
-
+    std::string font_path = am.ensureAvailable(font_name);
+    if (font_path.empty()) { logx::E("font path invalid"); return false; }
     // 1) shader program
-    if (!initProgram()) return false;
+    if (!initProgram(am)) { return false; }
 
     // 2) font + atlas
-    if (!initFont(fontFilePath, pixelSize)) { destroyProgram(); return false; }
+    if (!initFont(font_path, pixelSize)) { destroyProgram(); return false; }
     if (!initAtlas(atlasW, atlasH)) { destroyFont(); destroyProgram(); return false; }
 
     std::memset(m_glyphs, 0, sizeof(m_glyphs));
     return true;
 }
-
 void TextRenderer::shutdown() {
     // Text VBOs
     for (auto& t : m_items) {
-#if GLES_VERSION == 3
         if (t.vao) glDeleteVertexArrays(1, &t.vao);
         t.vao = 0;
-#endif
         if (t.vbo) glDeleteBuffers(1, &t.vbo);
         t.vbo = 0;
     }
@@ -68,7 +127,6 @@ void TextRenderer::shutdown() {
 }
 
 /* ---------------- Program ---------------- */
-
 GLuint TextRenderer::compileShader(GLenum type, const char* src) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, nullptr);
@@ -77,12 +135,12 @@ GLuint TextRenderer::compileShader(GLenum type, const char* src) {
     GLint ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
+        logShader(s, (type == GL_VERTEX_SHADER) ? "VERT" : "FRAG");
         glDeleteShader(s);
         return 0;
     }
     return s;
 }
-
 GLuint TextRenderer::linkProgram(const char* vs, const char* fs) {
     GLuint v = compileShader(GL_VERTEX_SHADER, vs);
     GLuint f = compileShader(GL_FRAGMENT_SHADER, fs);
@@ -96,12 +154,6 @@ GLuint TextRenderer::linkProgram(const char* vs, const char* fs) {
     glAttachShader(p, v);
     glAttachShader(p, f);
 
-    #if GLES_VERSION != 3
-    // match your vertex format
-    glBindAttribLocation(p, 0, "aPos");
-    glBindAttribLocation(p, 1, "aUV");
-    #endif
-
     glLinkProgram(p);
 
     glDeleteShader(v);
@@ -110,96 +162,75 @@ GLuint TextRenderer::linkProgram(const char* vs, const char* fs) {
     GLint ok = 0;
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
     if (!ok) {
+        logProgram(p);
         glDeleteProgram(p);
         return 0;
     }
+    logx::I("linkProgram done");
     return p;
 }
-
-bool TextRenderer::initProgram() {
-    // Same shader pair you used in main.cpp
-    #if GLES_VERSION == 3
-    const char* vs =
-        "#version 300 es\n"
-        "precision mediump float;\n"
-        "uniform mat4 uMVP;\n"
-        "uniform vec2 uTranslate;\n"
-        "layout(location=0) in vec2 aPos;\n"
-        "layout(location=1) in vec2 aUV;\n"
-        "out vec2 vUV;\n"
-        "void main() {\n"
-            "vUV = aUV;\n"
-            "vec2 p = aPos + uTranslate;\n"
-            "gl_Position = uMVP * vec4(p, 0.0, 1.0);\n"
-        "}\n";
-    const char* fs =
-        "#version 300 es\n"
-        "precision mediump float;\n"
-        "uniform sampler2D uTex;\n"
-        "uniform vec4 uColor;\n"
-        "in vec2 vUV;\n"
-        "out vec4 fragColor;\n"
-        "void main() {\n"
-            "float a = texture(uTex, vUV).r;\n"
-            "fragColor = vec4(uColor.rgb, uColor.a * a);\n"
-        "}\n";
-    #else
-    const char* vs =
-        "uniform mat4 uMVP;\n"
-        "uniform vec2 uTranslate;\n"
-        "attribute vec2 aPos;\n"
-        "attribute vec2 aUV;\n"
-        "varying vec2 vUV;\n"
-        "void main(){\n"
-        "  vUV = aUV;\n"
-        "  vec2 p = aPos + uTranslate;\n"
-        "  gl_Position = uMVP * vec4(p,0.0,1.0);\n"
-        "}\n";
-    const char* fs =
-        "precision mediump float;\n"
-        "uniform sampler2D uTex;\n"
-        "uniform vec4 uColor;\n"
-        "varying vec2 vUV;\n"
-        "void main(){\n"
-        "  float a = texture2D(uTex, vUV).a;\n"
-        "  gl_FragColor = vec4(uColor.rgb, uColor.a * a);\n"
-        "}\n";
-    #endif
-
-    m_prog = linkProgram(vs, fs);
+bool TextRenderer::initProgram(const Assets::Manager& am) {
+    std::vector<char> vs = am.read("shaders/text.vert");
+    std::vector<char> fs = am.read("shaders/text.frag");
+    if (vs.empty() || fs.empty()) {
+        logx::E("failed reading text shaders from storage");
+        return false;
+    }
+    
+    m_prog = linkProgram(reinterpret_cast<char*>(vs.data()), reinterpret_cast<char*>(fs.data()));
     if (!m_prog) return false;
 
     m_uMVP       = glGetUniformLocation(m_prog, "uMVP");
     m_uTex       = glGetUniformLocation(m_prog, "uTex");
-    m_uColor     = glGetUniformLocation(m_prog, "uColor");
+    //m_uColor     = glGetUniformLocation(m_prog, "uColor");
     m_uTranslate = glGetUniformLocation(m_prog, "uTranslate");
 
+    logx::I("initProgram done");
     return true;
 }
-
 void TextRenderer::destroyProgram() {
     if (m_prog) glDeleteProgram(m_prog);
     m_prog = 0;
-    m_uMVP = m_uTex = m_uColor = m_uTranslate = -1;
+    m_uMVP = m_uTex = m_uTranslate = -1;
 }
 
 /* ---------------- Font (FreeType + HarfBuzz) ---------------- */
-
-bool TextRenderer::initFont(const char* fontFilePath, int pixelSize) {
+bool TextRenderer::initFont(const std::string& fontFilePath, int pixelSize) {
     m_pxSize = pixelSize;
     if (FT_Init_FreeType(&m_ft) != 0) return false;
-    if (FT_New_Face(m_ft, fontFilePath, 0, &m_face) != 0) return false;
-    if (FT_Set_Char_Size(m_face, 0, pixelSize * 64, 96, 96) != 0) return false;
+    if (FT_New_Face(m_ft, fontFilePath.c_str(), 0, &m_face) != 0) {
+        logx::Ef("FT_New_Face failed");
+        return false;
+    }
+    if (FT_Set_Char_Size(m_face, 0, pixelSize * 64, 96, 96) != 0) {
+        logx::Ef("FT_Set_Char_Size failed");
+        return false;
+    }
 
     m_hbFont = hb_ft_font_create_referenced(m_face);
-    if (!m_hbFont) return false;
+    if (!m_hbFont) {
+        logx::Ef("hb_ft_font_create_referenced failed");
+        return false;
+    }
 
     hb_font_set_scale(m_hbFont,
                       (int)m_face->size->metrics.x_ppem * 64,
                       (int)m_face->size->metrics.y_ppem * 64);
+    
+    auto& m = m_face->size->metrics;
+
+    // In FreeType, ascent is positive, descent is negative (typically).
+    float asc = (float)m.ascender / 64.0f;
+    float desc = (float)(-m.descender) / 64.0f; // make it positive magnitude
+    float gap = (float)(m.height - (m.ascender - m.descender)) / 64.0f; // optional
+
+    m_lm.ascent  = asc;
+    m_lm.descent = desc;
+    m_lm.lineGap = std::max(0.0f, gap);
+    
+    logx::I("initFont done");
     return true;
 }
-
 void TextRenderer::destroyFont() {
     if (m_hbFont) hb_font_destroy(m_hbFont);
     if (m_face) FT_Done_Face(m_face);
@@ -211,7 +242,6 @@ void TextRenderer::destroyFont() {
 }
 
 /* ---------------- Atlas ---------------- */
-
 bool TextRenderer::initAtlas(int w, int h) {
     m_atlasW = w; m_atlasH = h;
     m_atlasPixels.assign((size_t)w * (size_t)h, 0);
@@ -220,7 +250,6 @@ bool TextRenderer::initAtlas(int w, int h) {
     m_atlasUploaded = false;
     return true;
 }
-
 void TextRenderer::destroyAtlas() {
     if (m_atlasTex) glDeleteTextures(1, &m_atlasTex);
     m_atlasTex = 0;
@@ -229,7 +258,6 @@ void TextRenderer::destroyAtlas() {
     m_penX = m_penY = m_rowH = 0;
     m_atlasUploaded = false;
 }
-
 bool TextRenderer::atlasAlloc(int w, int h, int& outX, int& outY) {
     if (w <= 0 || h <= 0) return false;
     if (w > m_atlasW || h > m_atlasH) return false;
@@ -248,7 +276,6 @@ bool TextRenderer::atlasAlloc(int w, int h, int& outX, int& outY) {
     m_rowH = std::max(m_rowH, h);
     return true;
 }
-
 void TextRenderer::uploadAtlasIfNeeded() {
     if (m_atlasUploaded) return;
 
@@ -257,15 +284,9 @@ void TextRenderer::uploadAtlasIfNeeded() {
     
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     
-    #if GLES_VERSION == 3
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 
                  m_atlasW, m_atlasH, 0, 
                  GL_RED, GL_UNSIGNED_BYTE, m_atlasPixels.data());
-    #else
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA,
-                 m_atlasW, m_atlasH, 0,
-                 GL_ALPHA, GL_UNSIGNED_BYTE, m_atlasPixels.data());
-    #endif
     
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -276,19 +297,16 @@ void TextRenderer::uploadAtlasIfNeeded() {
 }
 
 /* ---------------- Glyph cache / rasterize ---------------- */
-
 TextRenderer::GlyphEntry* TextRenderer::findGlyph(uint32_t gid) {
     for (auto& g : m_glyphs) if (g.valid && g.gid == gid) return &g;
     return nullptr;
 }
-
 TextRenderer::GlyphEntry* TextRenderer::insertGlyph(uint32_t gid) {
     for (auto& g : m_glyphs) {
         if (!g.valid) { g.valid = true; g.gid = gid; return &g; }
     }
     return nullptr;
 }
-
 bool TextRenderer::rasterizeGlyph(GlyphEntry& out, uint32_t gid) {
     if (FT_Load_Glyph(m_face, gid,
                       FT_LOAD_RENDER | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP) != 0) {
@@ -333,9 +351,9 @@ bool TextRenderer::rasterizeGlyph(GlyphEntry& out, uint32_t gid) {
 }
 
 /* ---------------- Shaping / mesh ---------------- */
-
 hb_buffer_t* TextRenderer::shapeUtf8(const char* utf8) {
     hb_buffer_t* buf = hb_buffer_create();
+    hb_buffer_set_cluster_level(buf, HB_BUFFER_CLUSTER_LEVEL_MONOTONE_CHARACTERS);
     hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
     hb_buffer_set_script(buf, hb_script_from_string("Latn", -1));
     hb_buffer_set_language(buf, hb_language_from_string("en", -1));
@@ -343,23 +361,97 @@ hb_buffer_t* TextRenderer::shapeUtf8(const char* utf8) {
     hb_shape(m_hbFont, buf, nullptr, 0);
     return buf;
 }
-
 void TextRenderer::addGlyphQuad(std::vector<TextVtx>& vb,
                               float x0, float y0, float x1, float y1,
-                              float u0, float v0, float u1, float v1) {
-    vb.push_back({x0,y0,u0,v0});
-    vb.push_back({x1,y0,u1,v0});
-    vb.push_back({x1,y1,u1,v1});
+                              float u0, float v0, float u1, float v1,
+                              const RGBA& c) {
+    vb.emplace_back(x0,y0,u0,v0,c);
+    vb.emplace_back(x1,y0,u1,v0,c);
+    vb.emplace_back(x1,y1,u1,v1,c);
 
-    vb.push_back({x0,y0,u0,v0});
-    vb.push_back({x1,y1,u1,v1});
-    vb.push_back({x0,y1,u0,v1});
+    vb.emplace_back(x0,y0,u0,v0,c);
+    vb.emplace_back(x1,y1,u1,v1,c);
+    vb.emplace_back(x0,y1,u0,v1,c);
 }
 
-bool TextRenderer::buildMesh(const char* utf8, std::vector<TextVtx>& out) {
-    out.clear();
+bool TextRenderer::buildMesh(TextObj& t) {
+    t.mesh.clear();
 
-    hb_buffer_t* buf = shapeUtf8(utf8);
+    t.cpByteOffsets = buildUtf8Index(t.text.c_str());
+    const int numCP = utf8_codepoint_count_from_index(t.cpByteOffsets);
+    t.caretX.assign((size_t)numCP + 1, 0.0f);
+
+    hb_buffer_t* buf = shapeUtf8(t.text.c_str());
+    const unsigned int count = hb_buffer_get_length(buf);
+    hb_glyph_info_t* infos = hb_buffer_get_glyph_infos(buf, nullptr);
+    hb_glyph_position_t* pos = hb_buffer_get_glyph_positions(buf, nullptr);
+
+    float penX = 0.0f;
+    float penY = 0.0f;
+
+    t.caretX[0] = 0.0f;
+
+    for (unsigned int i = 0; i < count; i++) {
+        uint32_t gid = infos[i].codepoint;
+
+        GlyphEntry* ge = findGlyph(gid);
+        if (!ge) {
+            ge = insertGlyph(gid);
+            if (!ge) { hb_buffer_destroy(buf); return false; }
+            *ge = GlyphEntry{};
+            ge->valid = true;
+            ge->gid = gid;
+            if (!rasterizeGlyph(*ge, gid)) { hb_buffer_destroy(buf); return false; }
+            m_atlasUploaded = false;
+        }
+
+        float xOff = (float)pos[i].x_offset  / 64.0f;
+        float yOff = (float)pos[i].y_offset  / 64.0f;
+        float xAdv = (float)pos[i].x_advance / 64.0f;
+        float yAdv = (float)pos[i].y_advance / 64.0f;
+
+        const int cpIdx = codepointIndexFromCluster(infos[i].cluster, t.cpByteOffsets);
+
+        // Draw quad
+        float gx = penX + xOff + (float)ge->bearingX;
+        float gy = penY - yOff - (float)ge->bearingY;
+        if (ge->w > 0 && ge->h > 0) {
+            addGlyphQuad(t.mesh,
+                         gx, gy, gx + (float)ge->w, gy + (float)ge->h,
+                         ge->u0, ge->v0, ge->u1, ge->v1, t.c);
+        }
+
+        // Advance pen
+        float nextPenX = penX + xAdv;
+        float nextPenY = penY + yAdv;
+
+        // Store caret for "after this character" (best-effort)
+        // Clamp index into [0..numCP]
+        int after = std::min(std::max(cpIdx + 1, 0), numCP);
+        t.caretX[(size_t)after] = std::max(t.caretX[(size_t)after], nextPenX);
+
+        penX = nextPenX;
+        penY = nextPenY;
+    }
+
+    hb_buffer_destroy(buf);
+
+    // Make caretX monotone and fill missing
+    for (int k = 1; k <= numCP; k++) {
+        t.caretX[(size_t)k] = std::max(t.caretX[(size_t)k], t.caretX[(size_t)k - 1]);
+    }
+    return true;
+}
+/*bool TextRenderer::buildMesh(TextObj& t) {
+    t.mesh.clear();
+
+    t.cpByteOffsets = buildUtf8Index(t.text.c_str());
+    const int numCP = utf8_codepoint_count_from_index(t.cpByteOffsets);
+
+    // caretX[i] = x position of caret at codepoint index i (0..numCP)
+    t.caretX.assign((size_t)numCP + 1, 0.0f);
+
+    hb_buffer_t* buf = shapeUtf8(t.text.c_str());
     const unsigned int count = hb_buffer_get_length(buf);
 
     hb_glyph_info_t* infos = hb_buffer_get_glyph_infos(buf, nullptr);
@@ -367,7 +459,10 @@ bool TextRenderer::buildMesh(const char* utf8, std::vector<TextVtx>& out) {
 
     float penX = 0.0f;
     float penY = 0.0f;
-
+    
+    // Optional: seed first caret
+    if (!t.caretX.empty()) t.caretX[0] = 0.0f;
+    
     for (unsigned int i = 0; i < count; i++) {
         uint32_t gid = infos[i].codepoint;
 
@@ -387,36 +482,162 @@ bool TextRenderer::buildMesh(const char* utf8, std::vector<TextVtx>& out) {
         float xAdv = (float)pos[i].x_advance / 64.0f;
         float yAdv = (float)pos[i].y_advance / 64.0f;
 
+        // --- caret accumulation (simple, monotone) ---
+        // infos[i].cluster is UTF-8 byte index into the original string
+        const int cpIdx = codepointIndexFromCluster(infos[i].cluster, t.cpByteOffsets);
+
+        const float nextPenX = penX + xAdv;
+
+        // Write caret after that codepoint as far as we can infer.
+        // This is "good enough" for basic selection on single-line LTR text.
+        if (cpIdx >= 0 && cpIdx + 1 <= numCP) {
+            float& slot = t.caretX[(size_t)cpIdx + 1];
+            if (nextPenX > slot) slot = nextPenX;
+        }
+
         float gx = penX + xOff + (float)ge->bearingX;
         float gy = penY - yOff - (float)ge->bearingY;
 
         if (ge->w > 0 && ge->h > 0) {
-            addGlyphQuad(out,
-                         gx, gy,
-                         gx + (float)ge->w, gy + (float)ge->h,
-                         ge->u0, ge->v0, ge->u1, ge->v1);
+            addGlyphQuad(t.mesh,
+                         gx, gy, gx + (float)ge->w, gy + (float)ge->h,
+                         ge->u0, ge->v0, ge->u1, ge->v1, t.c);
         }
 
-        penX += xAdv;
+        penX = nextPenX;
         penY += yAdv;
     }
 
     hb_buffer_destroy(buf);
+    
+    // Fill any gaps so caretX is monotone (important for selection boxes).
+    for (int k = 1; k <= numCP; k++) {
+        if (t.caretX[(size_t)k] < t.caretX[(size_t)k - 1]) {
+            t.caretX[(size_t)k] = t.caretX[(size_t)k - 1];
+        }
+    }
+    
     return true;
+}
+*/
+
+/* ---------------- selection ---------------- */
+TextRenderer::Handle TextRenderer::hitTest(float screenX, float screenY) const {
+    // Iterate from end to start so last-created draws "on top" and wins.
+    for (int i = (int)m_items.size() - 1; i >= 0; --i) {
+        const auto& t = m_items[i];
+        if (!t.alive || !t.selectable) continue;
+
+        if (t.caretX.empty()) continue; // not shaped yet
+
+        float x0 = t.x;
+        float x1 = t.x + t.caretX.back();
+
+        float y0 = t.baselineY - m_lm.ascent;
+        float y1 = t.baselineY + m_lm.descent;
+
+        if (pointInRect(screenX, screenY, x0, y0, x1, y1)) {
+            return Handle{i};
+        }
+    }
+    return Handle{-1};
+}
+int TextRenderer::caretFromPoint(Handle h, float screenX, float screenY) const {
+    if (h.id < 0 || h.id >= (int)m_items.size()) return -1;
+    const auto& t = m_items[h.id];
+    if (!t.alive || !t.selectable) return -1;
+    if (t.caretX.empty()) return -1;
+
+    float localX = screenX - t.x;
+    // For single-line, y only gates whether it's "on the line".
+    float y0 = t.baselineY - m_lm.ascent;
+    float y1 = t.baselineY + m_lm.descent;
+    if (screenY < y0 || screenY > y1) return -1;
+
+    return caretIndexFromLocalX(t, localX);
+}
+int TextRenderer::caretFromPointNoY(Handle h, float screenX) const {
+    if (h.id < 0 || h.id >= (int)m_items.size()) return -1;
+    const auto& t = m_items[h.id];
+    if (!t.alive || !t.selectable) return -1;
+    if (t.caretX.empty()) return -1;
+    return caretIndexFromLocalX(t, screenX - t.x);
+}
+void TextRenderer::beginSelection(Handle h, float screenX, float screenY) {
+    TextObj* t = get(h);
+    if (!t || !t->selectable) return;
+
+    int c = caretFromPoint(h, screenX, screenY);
+    if (c < 0) return;
+
+    t->selecting = true;
+    t->selA = c;
+    t->selB = c;
+    t->caret = c;
+}
+void TextRenderer::updateSelection(Handle h, float screenX, float screenY) {
+    TextObj* t = get(h);
+    if (!t || !t->selectable || !t->selecting) return;
+
+    int c = caretFromPointNoY(h, screenX);
+    if (c < 0) return;
+
+    t->selB = c;
+    t->caret = c;
+}
+void TextRenderer::endSelection(Handle h) {
+    TextObj* t = get(h);
+    if (!t) return;
+    t->selecting = false;
+}
+TextRenderer::SelectionInfo TextRenderer::getSelectionInfo(Handle h) const {
+    SelectionInfo si;
+    si.h = h;
+
+    if (h.id < 0 || h.id >= (int)m_items.size()) return si;
+    const auto& t = m_items[h.id];
+    if (!t.alive) return si;
+
+    si.valid = !t.caretX.empty();
+    si.selectable = t.selectable;
+    si.caret = t.caret;
+    si.selA  = t.selA;
+    si.selB  = t.selB;
+
+    if (!si.valid) return si;
+
+    // Full text bounds in screen space
+    si.x0 = t.x;
+    si.x1 = t.x + t.caretX.back();
+    si.y0 = t.baselineY - m_lm.ascent;
+    si.y1 = t.baselineY + m_lm.descent;
+
+    // Selection bounds (if any)
+    int s0 = std::min(t.selA, t.selB);
+    int s1 = std::max(t.selA, t.selB);
+
+    if (s1 > s0) {
+        s0 = std::clamp(s0, 0, (int)t.caretX.size() - 1);
+        s1 = std::clamp(s1, 0, (int)t.caretX.size() - 1);
+
+        si.hasSelection = true;
+        si.selX0 = t.x + t.caretX[(size_t)s0];
+        si.selX1 = t.x + t.caretX[(size_t)s1];
+        si.selY0 = si.y0;
+        si.selY1 = si.y1;
+    }
+    return si;
 }
 
 /* ---------------- Text objects ---------------- */
-
 TextRenderer::Handle TextRenderer::createText() {
     for (int i = 0; i < (int)m_items.size(); i++) {
         if (!m_items[i].alive) {
             auto& t = m_items[i];
             t = TextObj{};
             glGenBuffers(1, &t.vbo);
-#if GLES_VERSION == 3
             glGenVertexArrays(1, &t.vao);
             setupTextVao(t.vao, t.vbo);
-#endif
             t.alive = true;
             t.cpuDirty = true;
             t.gpuDirty = true;
@@ -426,61 +647,55 @@ TextRenderer::Handle TextRenderer::createText() {
 
     TextObj t;
     glGenBuffers(1, &t.vbo);
-#if GLES_VERSION == 3
     glGenVertexArrays(1, &t.vao);
     setupTextVao(t.vao, t.vbo);
-#endif
+    
     m_items.push_back(std::move(t));
     return Handle{(int)m_items.size() - 1};
 }
-
 void TextRenderer::destroyText(Handle h) {
     TextObj* t = get(h);
     if (!t) return;
-#if GLES_VERSION == 3
+    
     if (t->vao) glDeleteVertexArrays(1, &t->vao);
     t->vao = 0;
-#endif
     if (t->vbo) glDeleteBuffers(1, &t->vbo);
     t->vbo = 0;
     t->alive = false;
 }
-
 TextRenderer::TextObj* TextRenderer::get(Handle h) {
     if (h.id < 0 || h.id >= (int)m_items.size()) return nullptr;
     if (!m_items[h.id].alive) return nullptr;
     return &m_items[h.id];
 }
-
 void TextRenderer::setText(Handle h, const char* utf8) {
     TextObj* t = get(h);
     if (!t) return;
     t->text = utf8 ? utf8 : "";
     t->cpuDirty = true;
 }
-
 void TextRenderer::setPos(Handle h, float x, float baselineY) {
     TextObj* t = get(h);
     if (!t) return;
     t->x = x;
     t->baselineY = baselineY;
 }
-
-void TextRenderer::setColor(Handle h, float r, float g, float b, float a) {
+void TextRenderer::setColor(Handle h, const RGBA& c) {
     TextObj* t = get(h);
     if (!t) return;
-    t->r=r; t->g=g; t->b=b; t->a=a;
+    t->c = c;
 }
-
 void TextRenderer::update() {
     for (auto& t : m_items) {
         if (!t.alive) continue;
 
         if (t.cpuDirty) {
             t.cpuDirty = false;
-            if (!buildMesh(t.text.c_str(), t.mesh)) {
+            if (!buildMesh(t)) {
+                logx::E("buildMesh failed");
                 t.mesh.clear();
             } else {
+                logx::If("mesh verts: {}", t.mesh.size());
                 t.gpuDirty = true;
             }
         }
@@ -497,7 +712,6 @@ void TextRenderer::update() {
 
     uploadAtlasIfNeeded();
 }
-
 void TextRenderer::draw(const float* mvp4x4) {
     if (!m_prog) return;
 
@@ -511,21 +725,10 @@ void TextRenderer::draw(const float* mvp4x4) {
     for (auto& t : m_items) {
         if (!t.alive) continue;
 
-        glUniform4f(m_uColor, t.r, t.g, t.b, t.a);
+        //glUniform4f(m_uColor, t.r, t.g, t.b, t.a);
         glUniform2f(m_uTranslate, t.x, t.baselineY);
-#if GLES_VERSION == 3
         glBindVertexArray(t.vao);
         glDrawArrays(GL_TRIANGLES, 0, (GLsizei)t.mesh.size());
-#else
-        glBindBuffer(GL_ARRAY_BUFFER, t.vbo);
-        glEnableVertexAttribArray(0);
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(TextVtx), (void*)offsetof(TextVtx, x));
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(TextVtx), (void*)offsetof(TextVtx, u));
-        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)t.mesh.size());
-#endif
     }
-#if GLES_VERSION == 3
     glBindVertexArray(0);
-#endif
 }

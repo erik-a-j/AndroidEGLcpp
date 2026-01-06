@@ -3,6 +3,8 @@ project(egl C CXX)
 
 #set(CMAKE_C_STANDARD 11)
 #set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(DEPS_DIR "$ENV{HOME}/src/third_party")
 set(FREETYPE_SRC "${DEPS_DIR}/freetype")
@@ -19,7 +21,7 @@ if (NOT EXISTS "${FREETYPE_SRC}/CMakeLists.txt" OR NOT EXISTS "${HARFBUZZ_SRC}/C
   endif()
 endif()
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+#set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_custom_target(copy_compile_commands ALL
     COMMAND ${CMAKE_COMMAND} -E copy
     "${CMAKE_BINARY_DIR}/compile_commands.json"
@@ -37,6 +39,7 @@ add_custom_target(copy_font ALL
 # Build glue directly into the shared library so ANativeActivity_onCreate is present.
 add_library(native-lib SHARED
     main.cpp
+    assets.cpp
     javahack.cpp
     ui_renderer.cpp
     text_renderer.cpp
@@ -46,7 +49,7 @@ add_library(native-lib SHARED
 target_include_directories(native-lib PRIVATE
     ${ANDROID_NDK}/sources/android/native_app_glue
 )
-add_dependencies(native-lib copy_font copy_compile_commands)
+add_dependencies(native-lib copy_font) #copy_compile_commands)
 
 set(FT_DISABLE_ZLIB TRUE CACHE BOOL "" FORCE)
 set(FT_DISABLE_BZIP2 TRUE CACHE BOOL "" FORCE)

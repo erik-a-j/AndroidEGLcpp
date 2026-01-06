@@ -1,4 +1,7 @@
 #include "javahack.hpp"
+#include <jni.h>
+#include <android/native_activity.h>
+
 namespace JavaHack {
 int get_status_bar_inset_top_px(struct android_app* app) {
     JNIEnv* env = nullptr;
