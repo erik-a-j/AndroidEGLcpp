@@ -1,7 +1,7 @@
 #version 300 es
 // text.vert
 
-precision mediump float;
+precision highp float;
 
 uniform mat4 uMVP;
 uniform vec2 uTranslate;

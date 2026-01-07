@@ -1,7 +1,7 @@
 #version 300 es
 // text.frag
 
-precision mediump float;
+precision highp float;
 
 uniform sampler2D uTex;
 

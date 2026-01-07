@@ -1,13 +1,63 @@
 #include "assets.hpp"
 
-#define TAG_NAMESPACE "Assets"
-#include "logging.hpp"
-
 #include <fstream>
 #include <cerrno>
 #include <cstddef>
 
+#include <android/system_fonts.h>
+#include <fcntl.h>
+
+#include "logging.hpp"
+static constexpr char NS[] = "Assets";
+using logx = logger::logx<NS>;
+
 namespace Assets {
+
+static std::vector<char> read_bytes(std::ifstream& f) {
+    std::vector<char> b{};
+    f.seekg(0, std::ios::end);
+    size_t fsize = f.tellg();
+    f.seekg(0);
+    if (!fsize) return {};
+    b.resize(fsize);
+    f.read(b.data(), b.size());
+    return b;
+}
+static std::vector<char> read_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return read_bytes(f);
+}
+
+Font Manager::get_font(const std::string& name) const {
+    Font f{};
+    logx::If("get_font: target name={}", name);
+    
+    ASystemFontIterator* it = ASystemFontIterator_open();
+
+    while (AFont* font = ASystemFontIterator_next(it)) {
+        std::string path{AFont_getFontFilePath(font)};
+        logx::If("get_font: iter...: {}", path);
+        if (path.find(name) != std::string::npos) {
+            //fi.fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            logx::If("get_font: found match: {}", path);
+            f.bytes = read_bytes(path);
+            f.collectionIndex = AFont_getCollectionIndex(font);
+
+            for (size_t i = 0; i < AFont_getAxisCount(font); ++i) {
+                f.variationSettings.emplace_back(
+                    AFont_getAxisTag(font, i),
+                    AFont_getAxisValue(font, i));
+            }
+
+            AFont_close(font);
+            break;
+        }
+        AFont_close(font);
+    }
+
+    ASystemFontIterator_close(it);
+    return f;
+}
 
 Manager::Manager(android_app* app) {
     if (app && app->activity) {
@@ -87,15 +137,10 @@ std::vector<char> Manager::read(const std::string& asset_name) const {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) return {};
     
-    size_t fsize = f.tellg();
-    if (fsize == 0) return {};
+    std::vector<char> out = read_bytes(f);
+    if (out.empty()) return {};
     
-    f.seekg(0);
-    std::vector<char> out(fsize + 1);
-    f.read(out.data(), fsize);
-    if (!f) return {};
-    
-    out[fsize] = '\0';
+    out.push_back('\0');
     return out;
 }
 

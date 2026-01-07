@@ -7,6 +7,8 @@
 #include <hb-ft.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
+#include FT_OUTLINE_H
+#include FT_MULTIPLE_MASTERS_H
 
 #include "assets.hpp"
 #include "types.hpp"
@@ -95,6 +97,31 @@ public:
         float selX0=0, selY0=0, selX1=0, selY1=0;
     };
     SelectionInfo getSelectionInfo(Handle h) const;
+    
+    struct GlyphMetrics {
+        bool  valid = false;
+    
+        // Glyph ID used (after cmap lookup)
+        uint32_t gid = 0;
+    
+        // Bitmap box (pixels) like your cached rasterized glyph
+        int bmpW = 0;
+        int bmpH = 0;
+        int bearingX = 0; // bitmap_left
+        int bearingY = 0; // bitmap_top
+    
+        // Advances (pixels in your local text space)
+        float advanceX = 0.0f;
+        float advanceY = 0.0f;
+    
+        // Optional: font-space bbox (more “true” outline bounds), converted to pixels
+        float bboxXMin = 0.0f;
+        float bboxYMin = 0.0f;
+        float bboxXMax = 0.0f;
+        float bboxYMax = 0.0f;
+    };
+    GlyphMetrics measureCodepoint(uint32_t codepoint) const;
+    GlyphMetrics measureUtf8Glyph(const char* utf8, int byteOffset = 0) const; // convenience
 private:
     // ----- Text objects -----
     struct TextObj {
@@ -136,7 +163,7 @@ private:
     static GLuint linkProgram(const char* vs, const char* fs);
 
     // ----- Font (FreeType + HarfBuzz) -----
-    bool initFont(const std::string& fontFilePath, int pixelSize);
+    bool initFont(int pixelSize);
     void destroyFont();
 
     // ----- Atlas -----
@@ -177,12 +204,14 @@ private:
     GLint  m_uTex = -1;
     //GLint  m_uColor = -1;
     GLint  m_uTranslate = -1;
-
+    
+    
     // Font state
-    FT_Library m_ft = nullptr;
-    FT_Face    m_face = nullptr;
-    hb_font_t* m_hbFont = nullptr;
-    int        m_pxSize = 0;
+    Assets::Font m_font{};
+    FT_Library   m_ft     = nullptr;
+    FT_Face      m_face   = nullptr;
+    hb_font_t*   m_hbFont = nullptr;
+    int          m_pxSize = 0;
 
     // Atlas state
     int m_atlasW=0, m_atlasH=0;

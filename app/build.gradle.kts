@@ -3,6 +3,10 @@ plugins {
 }
 
 android {
+    /*sourceSets["main"].assets.srcDir(
+        layout.buildDirectory.dir("generated/assets")
+    )
+    */
     packaging {
       jniLibs {
         useLegacyPackaging = true
@@ -14,7 +18,7 @@ android {
     ndkPath = "/data/data/com.termux/files/home/opt/android-sdk/ndk"
     defaultConfig {
         applicationId = "com.example.egl"
-        minSdk = 21
+        minSdk = 29
         targetSdk = 35
 
         ndk {
@@ -23,7 +27,10 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments += listOf("-DANDROID_STL=c++_static", "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON")
+                arguments += listOf(
+                    "-DANDROID_STL=c++_static",
+                    "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
+                )
             }
         }
     }
@@ -40,3 +47,26 @@ android {
         }
     }
 }
+
+//val FONT_NAME: String = project.findProperty("FONT_NAME") as String? ?: "Roboto-Regular.ttf"
+/*val fontName = providers.gradleProperty("FONT_NAME")
+    .orElse("Roboto-Regular.ttf")
+
+val genFontAssets = tasks.register<Exec>("genFontAssets") {
+    val outDir = layout.buildDirectory.dir("generated/assets/fonts")
+
+    inputs.property("FONT_NAME", fontName)
+    outputs.dir(outDir)
+
+    commandLine(
+        "bash",
+        "${projectDir}/src/main/tools/copyfont.sh",
+        outDir.get().asFile.absolutePath,
+        fontName.get()
+    )
+}
+*/
+/*
+tasks.named("preBuild").configure {
+    dependsOn(genFontAssets)
+}*/

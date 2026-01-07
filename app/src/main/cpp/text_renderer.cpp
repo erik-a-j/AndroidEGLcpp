@@ -2,12 +2,16 @@
 #include <GLES3/gl3.h>
 
 #include "text_renderer.hpp"
+
 #include <cstring>
 #include <cstddef>
 #include <algorithm>
 
-#define LOG_NAMESPACE "TextR"
+#include <unistd.h>
+
 #include "logging.hpp"
+static constexpr char NS[] = "TextR";
+using logx = logger::logx<NS>;
 
 static void logShader(GLuint s, const char* label) {
     GLint len = 0;
@@ -28,6 +32,14 @@ static void logProgram(GLuint p) {
     }
 }
 
+static inline FT_Fixed f2dot16(float v) {
+    // FreeType uses 16.16 fixed-point for variation coordinates
+    // Round to nearest
+    double x = (double)v * 65536.0;
+    if (x >= 0.0) x += 0.5;
+    else         x -= 0.5;
+    return (FT_Fixed)x;
+}
 static std::vector<uint32_t> buildUtf8Index(const char* utf8) {
     std::vector<uint32_t> out;
     for (uint32_t i = 0; utf8[i]; ) {
@@ -43,14 +55,65 @@ static std::vector<uint32_t> buildUtf8Index(const char* utf8) {
 static int utf8_codepoint_count_from_index(const std::vector<uint32_t>& cpByteOffsets) {
     return (cpByteOffsets.size() >= 1) ? (int)cpByteOffsets.size() - 1 : 0;
 }
-static int codepointIndexFromCluster(
-    uint32_t clusterByte,
-    const std::vector<uint32_t>& cpByteOffsets)
-{
+static int codepointIndexFromCluster(uint32_t clusterByte, const std::vector<uint32_t>& cpByteOffsets) {
     // find greatest i where cpByteOffsets[i] <= clusterByte
     auto it = std::upper_bound(cpByteOffsets.begin(), cpByteOffsets.end(), clusterByte);
     if (it == cpByteOffsets.begin()) return 0;
     return (int)std::distance(cpByteOffsets.begin(), it - 1);
+}
+static uint32_t utf8DecodeOne(const char* s, int& advBytes) {
+    const unsigned char c0 = (unsigned char)s[0];
+    if (c0 < 0x80) { advBytes = 1; return c0; }
+    if ((c0 & 0xE0) == 0xC0) { advBytes = 2; return ((c0 & 0x1F) << 6) | (s[1] & 0x3F); }
+    if ((c0 & 0xF0) == 0xE0) { advBytes = 3; return ((c0 & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); }
+    advBytes = 4;
+    return ((c0 & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+}
+TextRenderer::GlyphMetrics TextRenderer::measureCodepoint(uint32_t cp) const {
+    GlyphMetrics gm{};
+
+    if (!m_face) return gm;
+
+    const FT_UInt gid = FT_Get_Char_Index(m_face, cp);
+    gm.gid = gid;
+    if (gid == 0) return gm; // missing glyph
+
+    // Load metrics (no render needed). You can keep your hinting policy here.
+    if (FT_Load_Glyph(m_face, gid, FT_LOAD_DEFAULT | FT_LOAD_NO_BITMAP) != 0) return gm;
+
+    const FT_GlyphSlot slot = m_face->glyph;
+
+    // Advance in 26.6 fixed-point
+    gm.advanceX = (float)slot->advance.x / 64.0f;
+    gm.advanceY = (float)slot->advance.y / 64.0f;
+
+    // If you want bitmap metrics exactly like your atlas rendering uses:
+    // do a render load (costly but accurate for bitmap box)
+    if (FT_Load_Glyph(m_face, gid, FT_LOAD_RENDER | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP) == 0) {
+        gm.bmpW = (int)slot->bitmap.width;
+        gm.bmpH = (int)slot->bitmap.rows;
+        gm.bearingX = slot->bitmap_left;
+        gm.bearingY = slot->bitmap_top;
+    }
+
+    // Outline bbox (works when outline exists); in font units -> convert to pixels.
+    if (slot->format == FT_GLYPH_FORMAT_OUTLINE) {
+        FT_BBox bb;
+        FT_Outline_Get_CBox(&slot->outline, &bb); // 26.6 units
+        gm.bboxXMin = (float)bb.xMin / 64.0f;
+        gm.bboxYMin = (float)bb.yMin / 64.0f;
+        gm.bboxXMax = (float)bb.xMax / 64.0f;
+        gm.bboxYMax = (float)bb.yMax / 64.0f;
+    }
+
+    gm.valid = true;
+    return gm;
+}
+TextRenderer::GlyphMetrics TextRenderer::measureUtf8Glyph(const char* utf8, int byteOffset) const {
+    if (!utf8) return GlyphMetrics{};
+    int adv = 0;
+    const uint32_t cp = utf8DecodeOne(utf8 + byteOffset, adv);
+    return measureCodepoint(cp);
 }
 int TextRenderer::caretIndexFromLocalX(const TextObj& t, float localX) {
     if (t.caretX.empty()) return 0;
@@ -69,7 +132,6 @@ int TextRenderer::caretIndexFromLocalX(const TextObj& t, float localX) {
 static bool pointInRect(float px, float py, float x0, float y0, float x1, float y1) {
     return (px >= x0 && px <= x1 && py >= y0 && py <= y1);
 }
-
 static void setupTextVao(GLuint vao, GLuint vbo) {
     glBindVertexArray(vao);
 
@@ -91,17 +153,23 @@ static void setupTextVao(GLuint vao, GLuint vbo) {
     glBindVertexArray(0);
 }
 
-TextRenderer::~TextRenderer() { shutdown(); }
+TextRenderer::~TextRenderer() { 
+    shutdown();
+    if (m_ft) FT_Done_FreeType(m_ft);
+    m_ft = nullptr;
+}
 
 bool TextRenderer::init(const Assets::Manager& am, const std::string& font_name, int pixelSize, int atlasW, int atlasH) {
     shutdown();
-    std::string font_path = am.ensureAvailable(font_name);
-    if (font_path.empty()) { logx::E("font path invalid"); return false; }
+    
+    m_font = am.get_font(font_name);
+    if (m_font.bytes.empty()) return false;
+    
     // 1) shader program
     if (!initProgram(am)) { return false; }
 
     // 2) font + atlas
-    if (!initFont(font_path, pixelSize)) { destroyProgram(); return false; }
+    if (!initFont(pixelSize)) { destroyProgram(); return false; }
     if (!initAtlas(atlasW, atlasH)) { destroyFont(); destroyProgram(); return false; }
 
     std::memset(m_glyphs, 0, sizeof(m_glyphs));
@@ -195,24 +263,70 @@ void TextRenderer::destroyProgram() {
 }
 
 /* ---------------- Font (FreeType + HarfBuzz) ---------------- */
-bool TextRenderer::initFont(const std::string& fontFilePath, int pixelSize) {
-    m_pxSize = pixelSize;
-    if (FT_Init_FreeType(&m_ft) != 0) return false;
-    if (FT_New_Face(m_ft, fontFilePath.c_str(), 0, &m_face) != 0) {
-        logx::Ef("FT_New_Face failed");
+bool TextRenderer::initFont(int pixelSize) {
+    if (pixelSize <= 0) {
+        logx::E("initFont: invalid pixelSize");
         return false;
     }
-    if (FT_Set_Char_Size(m_face, 0, pixelSize * 64, 96, 96) != 0) {
-        logx::Ef("FT_Set_Char_Size failed");
+    
+    m_pxSize = pixelSize;
+    if (!m_ft) {
+        if (FT_Init_FreeType(&m_ft) != 0) return false;
+    }
+    
+    FT_Open_Args args{};
+    args.flags = FT_OPEN_MEMORY;
+    args.memory_base = reinterpret_cast<const FT_Byte*>(m_font.bytes.data());
+    args.memory_size = static_cast<FT_Long>(m_font.bytes.size());
+    
+    if (FT_Open_Face(m_ft, &args, (FT_Long)m_font.collectionIndex, &m_face) != 0) {
+        logx::E("FT_Open_Face failed (fd + collectionIndex)");
+        return false;
+    }
+    
+    if (!m_font.variationSettings.empty() && FT_HAS_MULTIPLE_MASTERS(m_face)) {
+        FT_MM_Var* mm = nullptr;
+        if (FT_Get_MM_Var(m_face, &mm) == 0 && mm) {
+            std::vector<FT_Fixed> coords(mm->num_axis);
+
+            // Start from defaults
+            for (FT_UInt a = 0; a < mm->num_axis; ++a) {
+                coords[a] = mm->axis[a].def;
+            }
+
+            // Map axis tag -> index, then override
+            for (const auto& [tag, val] : m_font.variationSettings) {
+                for (FT_UInt a = 0; a < mm->num_axis; ++a) {
+                    // FreeType stores axis tag as FT_ULong (big-endian 4-char tag)
+                    if ((uint32_t)mm->axis[a].tag == tag) {
+                        coords[a] = f2dot16(val);
+                        break;
+                    }
+                }
+            }
+
+            FT_Error err = FT_Set_Var_Design_Coordinates(m_face, (FT_UInt)coords.size(), coords.data());
+            if (err) {
+                logx::Ef("FT_Set_Var_Design_Coordinates returned FT_Error({})", err);
+                return false;
+            }
+            FT_Done_MM_Var(m_ft, mm);
+        }
+    }
+    
+    if (FT_Set_Pixel_Sizes(m_face, 0, (FT_UInt)pixelSize) != 0) {
+        logx::E("FT_Set_Pixel_Sizes failed");
+        FT_Done_Face(m_face); m_face = nullptr;
         return false;
     }
 
     m_hbFont = hb_ft_font_create_referenced(m_face);
     if (!m_hbFont) {
-        logx::Ef("hb_ft_font_create_referenced failed");
+        logx::E("hb_ft_font_create_referenced failed");
+        FT_Done_Face(m_face); m_face = nullptr;
         return false;
     }
-
+    hb_ft_font_set_funcs(m_hbFont);
     hb_font_set_scale(m_hbFont,
                       (int)m_face->size->metrics.x_ppem * 64,
                       (int)m_face->size->metrics.y_ppem * 64);
@@ -234,10 +348,8 @@ bool TextRenderer::initFont(const std::string& fontFilePath, int pixelSize) {
 void TextRenderer::destroyFont() {
     if (m_hbFont) hb_font_destroy(m_hbFont);
     if (m_face) FT_Done_Face(m_face);
-    if (m_ft) FT_Done_FreeType(m_ft);
     m_hbFont = nullptr;
     m_face = nullptr;
-    m_ft = nullptr;
     m_pxSize = 0;
 }
 
@@ -355,9 +467,10 @@ hb_buffer_t* TextRenderer::shapeUtf8(const char* utf8) {
     hb_buffer_t* buf = hb_buffer_create();
     hb_buffer_set_cluster_level(buf, HB_BUFFER_CLUSTER_LEVEL_MONOTONE_CHARACTERS);
     hb_buffer_set_direction(buf, HB_DIRECTION_LTR);
-    hb_buffer_set_script(buf, hb_script_from_string("Latn", -1));
-    hb_buffer_set_language(buf, hb_language_from_string("en", -1));
+    //hb_buffer_set_script(buf, hb_script_from_string("Latn", -1));
+    //hb_buffer_set_language(buf, hb_language_from_string("en", -1));
     hb_buffer_add_utf8(buf, utf8, -1, 0, -1);
+    hb_buffer_guess_segment_properties(buf);
     hb_shape(m_hbFont, buf, nullptr, 0);
     return buf;
 }
@@ -442,84 +555,6 @@ bool TextRenderer::buildMesh(TextObj& t) {
     }
     return true;
 }
-/*bool TextRenderer::buildMesh(TextObj& t) {
-    t.mesh.clear();
-
-    t.cpByteOffsets = buildUtf8Index(t.text.c_str());
-    const int numCP = utf8_codepoint_count_from_index(t.cpByteOffsets);
-
-    // caretX[i] = x position of caret at codepoint index i (0..numCP)
-    t.caretX.assign((size_t)numCP + 1, 0.0f);
-
-    hb_buffer_t* buf = shapeUtf8(t.text.c_str());
-    const unsigned int count = hb_buffer_get_length(buf);
-
-    hb_glyph_info_t* infos = hb_buffer_get_glyph_infos(buf, nullptr);
-    hb_glyph_position_t* pos = hb_buffer_get_glyph_positions(buf, nullptr);
-
-    float penX = 0.0f;
-    float penY = 0.0f;
-    
-    // Optional: seed first caret
-    if (!t.caretX.empty()) t.caretX[0] = 0.0f;
-    
-    for (unsigned int i = 0; i < count; i++) {
-        uint32_t gid = infos[i].codepoint;
-
-        GlyphEntry* ge = findGlyph(gid);
-        if (!ge) {
-            ge = insertGlyph(gid);
-            if (!ge) { hb_buffer_destroy(buf); return false; }
-            *ge = GlyphEntry{};
-            ge->valid = true;
-            ge->gid = gid;
-            if (!rasterizeGlyph(*ge, gid)) { hb_buffer_destroy(buf); return false; }
-            m_atlasUploaded = false;
-        }
-
-        float xOff = (float)pos[i].x_offset / 64.0f;
-        float yOff = (float)pos[i].y_offset / 64.0f;
-        float xAdv = (float)pos[i].x_advance / 64.0f;
-        float yAdv = (float)pos[i].y_advance / 64.0f;
-
-        // --- caret accumulation (simple, monotone) ---
-        // infos[i].cluster is UTF-8 byte index into the original string
-        const int cpIdx = codepointIndexFromCluster(infos[i].cluster, t.cpByteOffsets);
-
-        const float nextPenX = penX + xAdv;
-
-        // Write caret after that codepoint as far as we can infer.
-        // This is "good enough" for basic selection on single-line LTR text.
-        if (cpIdx >= 0 && cpIdx + 1 <= numCP) {
-            float& slot = t.caretX[(size_t)cpIdx + 1];
-            if (nextPenX > slot) slot = nextPenX;
-        }
-
-        float gx = penX + xOff + (float)ge->bearingX;
-        float gy = penY - yOff - (float)ge->bearingY;
-
-        if (ge->w > 0 && ge->h > 0) {
-            addGlyphQuad(t.mesh,
-                         gx, gy, gx + (float)ge->w, gy + (float)ge->h,
-                         ge->u0, ge->v0, ge->u1, ge->v1, t.c);
-        }
-
-        penX = nextPenX;
-        penY += yAdv;
-    }
-
-    hb_buffer_destroy(buf);
-    
-    // Fill any gaps so caretX is monotone (important for selection boxes).
-    for (int k = 1; k <= numCP; k++) {
-        if (t.caretX[(size_t)k] < t.caretX[(size_t)k - 1]) {
-            t.caretX[(size_t)k] = t.caretX[(size_t)k - 1];
-        }
-    }
-    
-    return true;
-}
-*/
 
 /* ---------------- selection ---------------- */
 TextRenderer::Handle TextRenderer::hitTest(float screenX, float screenY) const {

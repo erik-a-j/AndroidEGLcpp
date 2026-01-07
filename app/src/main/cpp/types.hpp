@@ -13,19 +13,11 @@ struct RGBA {
      : r(re), g(gr), b(bl), a(alpha) {}
     RGBA(uint8_t re, uint8_t gr, uint8_t bl)
      : r(re), g(gr), b(bl) {}
-     
-    /*explicit RGBA(float fre, float fgr, float fbl, float falpha) 
-    : r(fromf(fre)), g(fromf(fgr)), b(fromf(fbl)), a(fromf(falpha)) {}
-    explicit RGBA(float fre, float fgr, float fbl) 
-    : r(fromf(fre)), g(fromf(fgr)), b(fromf(fbl)) {}
     
-    explicit RGBA(uint8_t re, uint8_t gr, uint8_t bl, float falpha)
-     : r(re), g(gr), b(bl), a(fromf(falpha)) {}
-    */
-    
-  private:
-    static uint8_t fromf(float f) {
-        float clamped = std::clamp(f, 0.0f, 1.0f);
-        return static_cast<uint8_t>(std::lroundf(255.0f * clamped));
+    uint32_t pack() const {
+        return (uint32_t(r)      ) |
+               (uint32_t(g) <<  8) |
+               (uint32_t(b) << 16) |
+               (uint32_t(a) << 24);
     }
 };

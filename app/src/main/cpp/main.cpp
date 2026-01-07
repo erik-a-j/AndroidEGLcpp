@@ -1,11 +1,7 @@
 // main.c
-
 #include "math.hpp"
 #include "assets.hpp"
 #include "javahack.hpp"
-
-#define TAG_NAMESPACE "Main"
-#include "logging.hpp"
 
 #include <jni.h>
 #include <android/native_activity.h>
@@ -14,7 +10,7 @@
 #include <android/asset_manager_jni.h>
 
 #include <EGL/egl.h>
-#include <GLES3/gl3.h>
+#include <GLES3/gl31.h>
 
 #include <cstdint>
 #include <cstdlib>
@@ -32,6 +28,10 @@
 
 // Add these near the top (after logx::If/logx::Ef)
 #include <cerrno>
+#include "logging.hpp"
+static constexpr char NS[] = "Main";
+using logx = logger::logx<NS>;
+
 
 static void gl_log_info(const char* label) {
     const char* vendor   = (const char*)glGetString(GL_VENDOR);
@@ -65,11 +65,22 @@ struct Renderer {
     } insets;
     bool initialized = false;
 };
+struct Btn {
+    float x, y;
+    float w, h;
+    UiRenderer::Handle btn{};
+    TextRenderer::Handle text{};
+};
+struct Buttons {
+    Btn b[10];
+    TextRenderer btext;
+};
 struct App {
     Assets::Manager asset_mgr;
     Renderer r;
     // Ui
     UiRenderer ui;
+    Buttons buttons;
     bool ui_ready = false;
     // Font/Text
     TextRenderer text;
@@ -88,7 +99,11 @@ static bool init_egl(Renderer* r, ANativeWindow* window) {
     if (r->display == EGL_NO_DISPLAY) { logx::E("EGL: eglGetDisplay failed"); egl_log_error("eglGetDisplay"); return false; }
 
     if (!eglInitialize(r->display, NULL, NULL)) { logx::E("EGL: eglInitialize failed"); egl_log_error("eglInitialize"); return false; }
-
+    if (!eglBindAPI(EGL_OPENGL_ES_API)) {
+        logx::E("EGL: eglBindAPI failed");
+        egl_log_error("eglBindAPI");
+        return false;
+    }
     const EGLint cfg_attr[] = {
         EGL_RENDERABLE_TYPE, 
         EGL_OPENGL_ES3_BIT,
@@ -128,6 +143,9 @@ static bool init_egl(Renderer* r, ANativeWindow* window) {
         egl_log_error("eglMakeCurrent");
         return false;
     }
+    GLint mvs = 0;
+    glGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, &mvs);
+    logx::If("GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS={}", mvs);
 
     eglQuerySurface(r->display, r->surface, EGL_WIDTH,  (EGLint*)&r->width);
     eglQuerySurface(r->display, r->surface, EGL_HEIGHT, (EGLint*)&r->height);
@@ -154,7 +172,80 @@ static void destroy_egl(Renderer* r) {
     r->initialized = false;
 }
 
+static void init_buttons(float scr_w, float scr_h, UiRenderer& ui, Buttons& b) {
+    const float margin_x = 150.f;
+    const float margin_y = 75.f;
+
+    // Numpad "panel" size
+    const float panel_h = scr_h * 0.5f;
+
+    const float area_x = margin_x;
+    const float area_w = scr_w - 2.f * margin_x;
+
+    // Grid
+    constexpr int cols = 3;
+    constexpr int rows = 4;
+
+    const float gx = area_w * 0.03f;
+    const float gy = panel_h * 0.02f;
+
+    const float btn_w = (area_w - gx * (cols - 1)) / cols;
+    const float btn_h = (panel_h - gy * (rows - 1)) / rows;
+
+    // Anchor the whole grid to the bottom of the screen (top-left origin)
+    const float grid_h = rows * btn_h + (rows - 1) * gy;
+    const float bottom = scr_h - margin_y;
+    const float area_y = bottom - grid_h;
+
+    UiColors cc{
+        {30, 35, 26, 255},
+        {30, 35, 26, 255},
+        {20, 23, 18, 255},
+        {20, 23, 18, 255},
+    };
+
+    auto make_btn = [&](int idx, float x, float y, const char *label) {
+        b.b[idx] = Btn{x, y, btn_w, btn_h, ui.createObj(), b.btext.createText()};
+        ui.objClear(b.b[idx].btn);
+        ui.objRectFilled(b.b[idx].btn, b.b[idx].x, b.b[idx].y, b.b[idx].w, b.b[idx].h, cc, b.b[idx].w / 2.5f);
+        auto gm = b.btext.measureCodepoint((uint32_t)*label);
+        if (gm.valid) {
+            logx::If("'{}' gid={} advX={} bmp={}x{} bearing=({}, {}) bbox=[{},{}]-[{},{}]",
+                     label, gm.gid, gm.advanceX, gm.bmpW, gm.bmpH, gm.bearingX, gm.bearingY,
+                     gm.bboxXMin, gm.bboxYMin, gm.bboxXMax, gm.bboxYMax);
+        }
+        float box_cx = 0.5f * (x + x + btn_w);
+        float box_cy = 0.5f * (y + y + btn_h);
+        float baseline_x = box_cx - (gm.bearingX + 0.5f * gm.bmpW);
+        float baseline_y = box_cy - (-gm.bearingY + 0.5f * gm.bmpH);
+        b.btext.setPos(b.b[idx].text, baseline_x, baseline_y);
+        b.btext.setColor(b.b[idx].text, {255, 255, 255, 255});
+        b.btext.setText(b.b[idx].text, label);
+    };
+
+    int idx = 0; // b[0..9]
+
+    for (int r = 0; r < rows; ++r) {
+        const float y = area_y + r * (btn_h + gy);
+
+        if (r == rows - 1) {
+            // last row: single button centered in the whole area
+            const float x = area_x + 0.5f * (area_w - btn_w);
+            char label[2]{(char)'0'};
+            make_btn(idx++, x, y, label);
+        } else {
+            for (int c = 0; c < cols; ++c) {
+                const float x = area_x + c * (btn_w + gx);
+                char label[2]{(char)('0' + idx + 1)};
+                make_btn(idx++, x, y, label);
+            }
+        }
+    }
+    
+}
 static bool init_ui(struct android_app* app) {
+    using namespace bitmask;
+    
     App* a = (App*)app->userData;
     if (!a->ui.init(a->asset_mgr)) { 
         logx::E("ui.init failed"); 
@@ -167,27 +258,34 @@ static bool init_ui(struct android_app* app) {
     
     UiRenderer::Handle sbar = a->ui.createObj();
     a->ui.objClear(sbar);
-    a->ui.objRectFilled(sbar, 0, 0, a->r.width, sbar_h, {0x1a, 0x1f, 0x1a, 0xff}, 8.0f, 1.0f);
-    //a->ui.objLine(sbar, 0, sbar_h, a->r.width, sbar_h, 2.0f, 0.0f, 0.0f, 0.0f, 1.0f);
-    //a->ui.objLine(sbar, 0, sbar_h, a->r.width, sbar_h, 3.0f, {1, 0, 0, 1});
+    a->ui.objRectFilled(sbar, 0, 0, a->r.width, sbar_h, {{0x1a, 0x1f, 0x1a, 0xff}}, 8.0f, 1.0f);
+    
+    //a->ui.objRectFilled(a->b0);
+    /*
     UiRenderer::Handle test = a->ui.createObj();
     a->ui.objClear(test);
-    a->ui.objRectFilled(test, a->r.width / 2, a->r.height / 2, 500, 500, {0x1a, 0x1f, 0xff, 0xff}, 20.0f, 1.0f);
-    
+    a->ui.objRectFilled(test, a->r.width / 2, a->r.height / 2, 500, 500, {{0x1a, 0x1f, 0xff, 0xff}}, 250.0f, 1.0f);
+    a->ui.objRectOpts(test, UiO::ColorTL | UiO::ColorBR, RGBA{255,0,0,255});
+    */
     a->ui_ready = true;
     return true;
 }
 static bool init_text(struct android_app* app) {
+    constexpr auto *font_name{"SourceSansPro-SemiBold.ttf"};
     App* a = (App*)app->userData;
-    if (!a->text.init(a->asset_mgr, "Roboto-Regular.ttf", 48, 2048, 2048)) {
+    if (!a->text.init(a->asset_mgr, font_name, 48, 2048, 2048)) {
         logx::E("a->text.init failed");
         return false;
     }
-    a->t0 = a->text.createText();
+    if (!a->buttons.btext.init(a->asset_mgr, font_name, 160, 2048, 2048)) {
+        logx::E("a->buttons.btext.init failed");
+        return false;
+    }
+    /*a->t0 = a->text.createText();
     a->text.setPos(a->t0, 500.0f, 1500.0f);
     a->text.setColor(a->t0, {255,255,255,255});
     a->text.setText(a->t0, "Elin luktar bajs");
-
+*/
     /*a->t1 = a->text.createText();
     a->text.setPos(a->t1, 24.0f, 200.0f);
     a->text.setColor(a->t1, {100, 150, 255, 255});
@@ -209,9 +307,8 @@ static void render(App* a) {
     if (a->ui_ready) {
         a->ui.begin();
         
-        a->ui.rectFilledVGrad(0, 0, a->r.width, a->r.height,
-                              {0x1f, 0x2a, 0x1f, 0xff},
-                              {0x1a, 0x1f, 0x1a, 0xff});
+        a->ui.rectFilled(0, 0, a->r.width, a->r.height,
+                              {{0x1f, 0x2a, 0x1f, 0xff}});
         
         if (a->text_ready && a->activeText.id != -1) {
             auto si = a->text.getSelectionInfo(a->activeText);
@@ -219,7 +316,7 @@ static void render(App* a) {
                 // Draw selection behind text
                 a->ui.rectFilled(si.selX0, si.selY0,
                                  si.selX1 - si.selX0, si.selY1 - si.selY0,
-                                 {0x30, 0x80, 0xff, 0x80}, 4.0f, 1.0f);
+                                 {{0x30, 0x80, 0xff, 0x80}}, 4.0f, 1.0f);
             }
     
             // Optional caret drawing (thin rect)
@@ -229,6 +326,8 @@ static void render(App* a) {
         }
 
         a->ui.end();
+        
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         a->ui.draw(mvp.data());
         a->ui.drawObjects(mvp.data());
     }
@@ -236,7 +335,10 @@ static void render(App* a) {
     // Text
     if (a->text_ready) {
         a->text.update();
+        a->buttons.btext.update();
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         a->text.draw(mvp.data());
+        a->buttons.btext.draw(mvp.data());
     }
 
     gl_check("render end");
@@ -244,10 +346,20 @@ static void render(App* a) {
 
 /* ---------------- App commands ---------------- */
 void destroy_app(App* a) {
-    a->ui.shutdown();
+    if (a->r.display != EGL_NO_DISPLAY &&
+        a->r.surface != EGL_NO_SURFACE &&
+        a->r.context != EGL_NO_CONTEXT) {
+        eglMakeCurrent(a->r.display, a->r.surface, a->r.surface, a->r.context);
+    }
+
+    a->ui.shutdown();     
     a->ui_ready = false;
-    a->text.shutdown();
+
+    a->text.shutdown();   
     a->text_ready = false;
+
+    a->buttons.btext.shutdown();
+    
     destroy_egl(&a->r);
 }
 static void handle_cmd(struct android_app* app, int32_t cmd) {
@@ -261,7 +373,6 @@ static void handle_cmd(struct android_app* app, int32_t cmd) {
                     return;
                 }
                 glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
                 
                 if (!init_ui(app)) {
                     logx::E("init_ui failed");
@@ -273,6 +384,8 @@ static void handle_cmd(struct android_app* app, int32_t cmd) {
                     return;
                 }
                 
+                init_buttons(a->r.width, a->r.height, a->ui, a->buttons);
+    
                 //logx::If("status-bar: %d", a->r.insets.status_bar_height);
                 logx::I("Ready");
             }
